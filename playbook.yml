@@ -1,0 +1,141 @@
+---
+- hosts: vagrant
+  vars:
+    epel_release_rpm: http://mirror.us.leaseweb.net/epel/6/i386/epel-release-6-8.noarch.rpm
+    rpmforge_release_rpm: http://packages.sw.be/rpmforge-release/rpmforge-release-0.5.2-2.el6.rf.x86_64.rpm
+    ice_release_rpm: http://www.zeroc.com/download/Ice/3.4/rhel6/zeroc-ice-rhel6.repo
+    postgres_release_rpm: http://yum.postgresql.org/9.1/redhat/rhel-6-x86_64/pgdg-centos91-9.1-4.noarch.rpm
+    nginx_release_rpm: http://nginx.org/packages/centos/6/noarch/RPMS/nginx-release-centos-6-0.el6.ngx.noarch.rpm
+    java_version: 1.7.0
+    postgres_version: 91
+    postgres_dotted_version: 9.1
+    lang_encoding: en_US.UTF-8
+    omero_db_owner: vagrant
+    omero_db_name: omero
+    omero_db_pass: omero
+    omero_db_version: OMERO4.4
+    omero_db_patch: 0
+    omero_root_password: omero
+    fastcgi_port: 9292
+  sudo: yes
+  tasks:
+    - service: name=iptables state=stopped enabled=no
+    - yum: name=${epel_release_rpm}
+    - yum: name=${rpmforge_release_rpm}
+    - yum: name=${postgres_release_rpm}
+    - yum: name=${nginx_release_rpm}
+    - command: wget -qO /etc/yum.repos.d/zeroc-ice.repo ${ice_release_rpm} creates=/etc/yum.repos.d/zeroc-ice.repo
+    # nginx
+    - yum: name=nginx
+    # needed for python and other buildy things
+    - yum: name=gcc
+    - yum: name=gcc-c++
+    - yum: name=libxml2-devel
+    - yum: name=libxslt-devel
+    - yum: name=zlib-devel
+    - yum: name=sqlite-devel
+    - yum: name=apg
+    # ice
+    - yum: name=ice
+    - yum: name=ice-python
+    - yum: name=ice-servers
+    - yum: name=ice-libs
+    - yum: name=ice-utils
+    - yum: name=ice-java-devel
+    - yum: name=ice-python-devel
+    - yum: name=ice-java
+    - yum: name=ice-c++-devel
+    # postgres
+    - yum: name=postgresql${postgres_version}
+    - yum: name=postgresql${postgres_version}-server
+    - yum: name=postgresql${postgres_version}-contrib
+    - yum: name=postgresql${postgres_version}-devel
+    - command: /usr/sbin/update-alternatives --install /usr/bin/pg_config pgsql-pg_config /usr/pgsql-9.1/bin/pg_config 910
+    # additional python packages
+    - yum: name=python-virtualenv
+    - yum: name=scipy
+    - yum: name=python-imaging
+    - yum: name=python-devel
+    - yum: name=hdf5-devel
+    - yum: name=python-pip
+    - pip: name=numpy version=1.6
+    - pip: name=numexpr
+    - pip: name=Cython
+    - pip: name=numpy
+    - pip: name=tables
+    - yum: name=java-${java_version}-openjdk
+    - yum: name=java-${java_version}-openjdk-devel
+    - yum: name=python-psycopg2
+    # gunicorn
+    - pip: name=Django version=1.5.1
+    - pip: name=psycopg2 version=2.5
+    - pip: name=httplib2 version=0.8
+    - pip: name=lxml version=3.2.0
+    - pip: name=pytz version=2013b
+    - pip: name=sunburnt version=0.6
+    - pip: name=ujson version=1.30
+    - pip: name=gunicorn version=0.17.4
+    - pip: name=setproctitle version=1.1.7
+
+
+    # package installation is complete configure system
+    - name: initialize postgresql db
+      command: /sbin/service postgresql-${postgres_dotted_version} initdb ${lang_encoding}
+               creates=~postgres/${postgres_dotted_version}/data/PG_VERSION
+    - name: fix pg_hba.conf
+      command: /usr/bin/perl -p -i -e's/ident$/md5/' /var/lib/pgsql/${postgres_dotted_version}/data/pg_hba.conf
+
+    - service: name=postgresql-${postgres_dotted_version} state=started enabled=yes
+
+    - name: create db user
+      sudo_user: postgres
+      postgresql_user: name=${omero_db_owner} password=${omero_db_pass}
+
+    - name: create db
+      sudo_user: postgres
+      postgresql_db: name=${omero_db_name} owner=${omero_db_owner}
+
+    - name: create omero home
+      file: src=/vagrant/OMERO-CURRENT dest=/opt/omero state=link
+
+    - name: create schema for omero
+      sudo: no
+      shell: /opt/omero/bin/omero db script --file - ${omero_db_version} ${omero_db_patch} ${omero_root_password} | psql ${omero_db_name} && touch /opt/omero/.omero-schema-created
+             creates=/opt/omero/.omero-schema-created
+
+    - name: create omero data repo
+      file: path=/OMERO owner=${omero_db_owner} group=${omero_db_owner} state=link src=/vagrant/OMERO
+
+    - name: create omero home dir
+      file: path=/opt/omero owner=${omero_db_owner} group=${omero_db_owner} state=link src=/vagrant/OMERO-CURRENT
+
+    - name: set omero.db.user
+      command: /opt/omero/bin/omero config set omero.db.user ${omero_db_owner}
+      sudo: no
+
+    - name: start omero.server
+      command: /opt/omero/bin/omero admin start creates=/opt/omero/var/master/master.pid
+      sudo: no
+
+    # - command: /usr/bin/gunicorn_django --pid /opt/omero/var/gunicorn.pid --workers 4 --name omero --bind 127.0.0.1:${fastcgi_port} --daemon
+               # chdir=/opt/omero/lib/python/omeroweb
+
+    - name: start omero.web
+      command: /opt/omero/bin/omero web start creates=/opt/omero/var/django.pid
+      sudo: no
+
+    - name: configure nginx
+      shell: /opt/omero/bin/omero web config nginx --http 80 --system > /vagrant/omero-nginx.conf
+      sudo: no
+
+    - file: dest=/etc/nginx/conf.d/default.conf state=absent
+    - file: path=/etc/nginx/conf.d/omero.conf state=link src=/vagrant/omero-nginx.conf
+      notify:
+        - restart nginx
+
+  handlers:
+    - name: restart nginx
+      service: name=nginx state=restarted enabled=yes
+
+
+
